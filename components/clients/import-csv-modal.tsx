@@ -1,431 +1,138 @@
 'use client'
 
-import { useState, useRef, useCallback } from 'react'
+import { useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { Button } from '@/components/ui/button'
-import { X, Upload, CheckCircle, AlertCircle } from 'lucide-react'
+import { X, Upload, ContactRound, CheckCircle, AlertCircle } from 'lucide-react'
+import { IMPORT_BATCH_SIZE, MAX_IMPORT_CLIENTS, matrixToClients, parseClientsCsv, parseVcard, uniqueClients, type ImportedClient } from '@/lib/client-import'
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface ParsedRow {
-  name: string
-  phone: string
-  email: string
-  notes: string
-}
-
-type Step = 'platform' | 'upload' | 'result'
-
-interface Props {
-  open: boolean
-  onClose: () => void
-  onImported: (count: number) => void
-}
-
-// ─── Platform instructions ────────────────────────────────────────────────────
-
-const PLATFORMS = [
-  { id: 'fresha',   label: 'Fresha',    hint: 'Clients → Options (top right) → Export → CSV' },
-  { id: 'vagaro',   label: 'Vagaro',    hint: 'More → Reports → Customers → Action → Export Excel, then save as CSV' },
-  { id: 'booksy',   label: 'Booksy',    hint: 'Customers → More Options → Export → CSV' },
-  { id: 'mindbody', label: 'Mindbody',  hint: 'Reports → Clients → Mailing Lists → Export → CSV' },
-  { id: 'square',   label: 'Square',    hint: 'Customers → Customer Directory → Export' },
-  { id: 'other',    label: 'Other',     hint: 'Export your client list as CSV with columns: name, phone, email' },
-] as const
-
-// ─── CSV parser (no external libraries) ─────────────────────────────────────
-
-function parseCSV(text: string): string[][] {
-  const rows: string[][] = []
-  let row: string[] = []
-  let field = ''
-  let inQuotes = false
-  let i = 0
-
-  while (i < text.length) {
-    const ch = text[i]
-    const next = text[i + 1]
-
-    if (inQuotes) {
-      if (ch === '"' && next === '"') {
-        // escaped quote
-        field += '"'
-        i += 2
-        continue
-      } else if (ch === '"') {
-        inQuotes = false
-        i++
-        continue
-      } else {
-        field += ch
-        i++
-        continue
-      }
-    }
-
-    if (ch === '"') {
-      inQuotes = true
-      i++
-      continue
-    }
-
-    if (ch === ',') {
-      row.push(field.trim())
-      field = ''
-      i++
-      continue
-    }
-
-    if (ch === '\r' && next === '\n') {
-      row.push(field.trim())
-      if (row.some((c) => c !== '')) rows.push(row)
-      row = []
-      field = ''
-      i += 2
-      continue
-    }
-
-    if (ch === '\n' || ch === '\r') {
-      row.push(field.trim())
-      if (row.some((c) => c !== '')) rows.push(row)
-      row = []
-      field = ''
-      i++
-      continue
-    }
-
-    field += ch
-    i++
-  }
-
-  // last row
-  if (field.length > 0 || row.length > 0) {
-    row.push(field.trim())
-    if (row.some((c) => c !== '')) rows.push(row)
-  }
-
-  return rows
-}
-
-// ─── Column detection ─────────────────────────────────────────────────────────
-
-function detectColumns(headers: string[]): { name: number; phone: number; email: number; notes: number } {
-  const idx = (keywords: string[]) => {
-    for (const kw of keywords) {
-      const i = headers.findIndex((h) => h.toLowerCase().includes(kw.toLowerCase()))
-      if (i !== -1) return i
-    }
-    return -1
-  }
-
-  return {
-    name:  idx(['name', 'full name', 'client name', 'customer name', 'contact name', 'first name']),
-    phone: idx(['phone', 'mobile', 'cell', 'telephone', 'tel', 'number']),
-    email: idx(['email', 'e-mail', 'mail']),
-    notes: idx(['notes', 'note', 'comments', 'comment', 'memo']),
-  }
-}
-
-function rowsToClients(rows: string[][], colMap: ReturnType<typeof detectColumns>): ParsedRow[] {
-  return rows.map((row) => ({
-    name:  colMap.name  >= 0 ? (row[colMap.name]  ?? '') : '',
-    phone: colMap.phone >= 0 ? (row[colMap.phone] ?? '') : '',
-    email: colMap.email >= 0 ? (row[colMap.email] ?? '') : '',
-    notes: colMap.notes >= 0 ? (row[colMap.notes] ?? '') : '',
-  }))
-}
-
-// ─── Component ────────────────────────────────────────────────────────────────
+interface Props { open: boolean; onClose: () => void; onImported: (count: number) => void }
+interface DeviceContact { name?: string[]; tel?: string[]; email?: string[] }
+interface ContactPicker { select: (fields: string[], options: { multiple: boolean }) => Promise<DeviceContact[]> }
+type Item = ImportedClient & { selected: boolean }
 
 export function ImportCsvModal({ open, onClose, onImported }: Props) {
-  const [step, setStep]               = useState<Step>('platform')
-  const [platform, setPlatform]       = useState<string | null>(null)
-  const [dragging, setDragging]       = useState(false)
-  const [parsedRows, setParsedRows]   = useState<ParsedRow[]>([])
-  const [colMap, setColMap]           = useState<ReturnType<typeof detectColumns> | null>(null)
-  const [headers, setHeaders]         = useState<string[]>([])
-  const [rowCount, setRowCount]       = useState(0)
-  const [noPhoneWarn, setNoPhoneWarn] = useState(false)
-  const [loading, setLoading]         = useState(false)
-  const [resultImported, setResultImported] = useState(0)
-  const [resultSkipped, setResultSkipped]   = useState(0)
-  const [importError, setImportError] = useState<string | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [items, setItems] = useState<Item[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [sources, setSources] = useState<string[]>([])
+  const [skipped, setSkipped] = useState(0)
+  const [result, setResult] = useState<{ imported: number; skipped: number; failed: boolean } | null>(null)
+  const [progress, setProgress] = useState(0)
+  const [page, setPage] = useState(0)
+  const input = useRef<HTMLInputElement>(null)
+  const lock = useRef(false)
+  const selected = items.filter(item => item.selected)
+  const preview = items.slice(page * 50, (page + 1) * 50)
 
-  // Reset state when closed
-  function handleClose() {
-    setStep('platform')
-    setPlatform(null)
-    setParsedRows([])
-    setColMap(null)
-    setHeaders([])
-    setRowCount(0)
-    setNoPhoneWarn(false)
-    setLoading(false)
-    setImportError(null)
+  function close() {
+    if (lock.current) return
+    setItems([]); setSources([]); setError(''); setSkipped(0); setResult(null); setProgress(0); setPage(0)
     onClose()
   }
 
-  // Process file
-  const processFile = useCallback((file: File) => {
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      const text = e.target?.result as string
-      const matrix = parseCSV(text)
-      if (matrix.length < 2) {
-        setImportError('File appears empty or could not be parsed.')
-        return
-      }
-      const hdrs = matrix[0]
-      const dataRows = matrix.slice(1)
-      const map = detectColumns(hdrs)
-      setHeaders(hdrs)
-      setColMap(map)
-      setRowCount(dataRows.length)
-      setParsedRows(rowsToClients(dataRows, map))
-      setNoPhoneWarn(map.phone === -1)
-      setImportError(null)
-      setStep('upload')
-    }
-    reader.onerror = () => setImportError('Failed to read file.')
-    reader.readAsText(file, 'UTF-8')
-  }, [])
-
-  function handleFileInput(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (file) processFile(file)
-    e.target.value = ''
+  function addContacts(rows: ImportedClient[], names: string[]) {
+    if (!rows.length) return
+    if (items.length + rows.length > MAX_IMPORT_CLIENTS) throw new Error(`Import up to ${MAX_IMPORT_CLIENTS} contacts at a time.`)
+    const combined = uniqueClients([...items, ...rows])
+    if (!combined.clients.length) throw new Error('No named contacts found. Check the name column or contact names before importing.')
+    const previous = new Map(items.map(item => [item, item.selected]))
+    setItems(combined.clients.map(item => ({ ...item, selected: previous.get(item as Item) ?? true })))
+    setSkipped(count => count + combined.skipped)
+    setSources(current => [...current, ...names]); setPage(0)
   }
 
-  function handleDrop(e: React.DragEvent) {
-    e.preventDefault()
-    setDragging(false)
-    const file = e.dataTransfer.files?.[0]
-    if (file) processFile(file)
-  }
-
-  async function handleImport() {
-    setLoading(true)
-    setImportError(null)
+  async function readFiles(files: File[]) {
+    if (!files.length || lock.current) return
+    lock.current = true; setBusy(true); setError('')
     try {
-      const res = await fetch('/api/clients/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clients: parsedRows }),
-      })
-      const data = await res.json()
-
-      if (res.status === 402) {
-        setImportError(
-          `You've reached the ${data.limit}-client limit on the Free plan. Upgrade to Starter to import unlimited clients.`
-        )
-        setLoading(false)
-        return
+      if (files.length > 20 || files.reduce((sum, f) => sum + f.size, 0) > 10 * 1024 * 1024) throw new Error('Choose up to 20 files, with a combined size of 10 MB or less.')
+      const rows: ImportedClient[] = [], names: string[] = [], errors: string[] = []
+      for (const file of files) {
+        try {
+          if (file.size > 5 * 1024 * 1024) throw new Error('File exceeds 5 MB.')
+          const extension = file.name.split('.').pop()?.toLowerCase()
+          let parsed: ImportedClient[] = []
+          if (extension === 'vcf' || extension === 'vcard') parsed = parseVcard(await file.text())
+          else if (extension === 'csv' || extension === 'tsv') parsed = parseClientsCsv(await file.text())
+          else if (extension === 'xlsx' || extension === 'xls') {
+            const XLSX = await import('xlsx')
+            const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' })
+            for (const name of workbook.SheetNames) {
+              const matrix = XLSX.utils.sheet_to_json<string[]>(workbook.Sheets[name], { header: 1, raw: false, defval: '' })
+              if (matrix.length > 1) parsed.push(...matrixToClients(matrix))
+            }
+            if (!parsed.length) throw new Error('No contacts found in this workbook.')
+          } else throw new Error('Supported formats: CSV, TSV, XLSX, XLS, VCF.')
+          if (rows.length + parsed.length + items.length > MAX_IMPORT_CLIENTS) throw new Error(`Import up to ${MAX_IMPORT_CLIENTS} contacts at a time.`)
+          rows.push(...parsed); names.push(file.name)
+        } catch (err) { errors.push(`${file.name}: ${err instanceof Error ? err.message : 'Could not read file.'}`) }
       }
-      if (!res.ok) {
-        setImportError(data.error ?? 'Import failed. Please try again.')
-        setLoading(false)
-        return
-      }
-
-      setResultImported(data.imported)
-      setResultSkipped(data.skipped)
-      setStep('result')
-      onImported(data.imported)
-    } catch {
-      setImportError('Network error. Please try again.')
-    } finally {
-      setLoading(false)
-    }
+      if (rows.length) addContacts(rows, names)
+      setError(errors.join('\n'))
+    } catch (err) { setError(err instanceof Error ? err.message : 'Could not read files.') }
+    finally { lock.current = false; setBusy(false) }
   }
 
-  const selectedPlatform = PLATFORMS.find((p) => p.id === platform)
-  const preview = parsedRows.slice(0, 5)
+  async function pickContacts() {
+    const picker = (navigator as Navigator & { contacts?: ContactPicker }).contacts
+    if (!picker?.select) {
+      setError('This browser cannot open the phone book directly. Export contacts as a vCard (.vcf), then choose that file here. iPhone: Contacts → Lists → hold a list → Export. Android: Contacts → Organize / Manage → Export to file.')
+      return
+    }
+    if (lock.current) return
+    lock.current = true; setBusy(true); setError('')
+    try {
+      const contacts = await picker.select(['name', 'tel', 'email'], { multiple: true })
+      addContacts(contacts.map(c => ({ name: c.name?.join(' ') || c.tel?.[0] || c.email?.[0] || '', phone: c.tel?.[0] ?? '', email: c.email?.[0] ?? '', notes: [...(c.tel?.slice(1) ?? []).map(t => `Additional phone: ${t}`), ...(c.email?.slice(1) ?? []).map(e => `Additional email: ${e}`)].join('\n') })), contacts.length ? ['Phone book'] : [])
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === 'AbortError')) setError('Contacts access was not granted. Select contacts again or import a .vcf file.')
+    } finally { lock.current = false; setBusy(false) }
+  }
+
+  async function importSelected() {
+    if (!selected.length || lock.current) return
+    lock.current = true; setBusy(true); setError(''); setProgress(0)
+    let imported = 0, ignored = skipped, completed = 0
+    try {
+      for (let offset = 0; offset < selected.length; offset += IMPORT_BATCH_SIZE) {
+        const batch = selected.slice(offset, offset + IMPORT_BATCH_SIZE)
+        const response = await fetch('/api/clients/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ clients: batch.map(({ name, phone, email, notes }) => ({ name, phone, email, notes })) }) })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error ?? 'Import failed.')
+        imported += data.imported; ignored += data.skipped; completed += batch.length; setProgress(completed)
+      }
+      setResult({ imported, skipped: ignored, failed: false })
+    } catch (err) {
+      setError(`${err instanceof Error ? err.message : 'Connection interrupted.'} ${completed} of ${selected.length} contacts processed. Check your client list before importing again.`)
+      setResult({ imported, skipped: ignored, failed: true })
+    } finally { lock.current = false; setBusy(false); onImported(imported) }
+  }
 
   return (
-    <Dialog.Root open={open} onOpenChange={(o) => { if (!o) handleClose() }}>
+    <Dialog.Root open={open} onOpenChange={value => { if (!value) close() }}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/50 z-40" />
-        <Dialog.Content
-          className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-white rounded-xl shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 focus:outline-none"
-        >
-          {/* Header */}
-          <div className="flex items-center justify-between mb-5">
-            <Dialog.Title className="text-lg font-semibold text-gray-900">
-              Import clients from CSV
-            </Dialog.Title>
-            <button onClick={handleClose} className="text-gray-400 hover:text-gray-600 transition-colors">
-              <X className="w-5 h-5" />
-            </button>
-          </div>
-
-          {/* ── Step: platform select ─────────────────────────────────────── */}
-          {step === 'platform' && (
-            <div>
-              <p className="text-sm text-gray-600 mb-4">
-                Select where you&apos;re importing from to get export instructions:
-              </p>
-              <div className="grid grid-cols-3 gap-2 mb-4">
-                {PLATFORMS.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => setPlatform(p.id)}
-                    className={`border rounded-lg py-2 px-3 text-sm font-medium transition-colors
-                      ${platform === p.id
-                        ? 'border-blue-600 bg-blue-50 text-blue-700'
-                        : 'border-gray-200 text-gray-700 hover:border-gray-300'
-                      }`}
-                  >
-                    {p.label}
-                  </button>
-                ))}
-              </div>
-
-              {selectedPlatform && (
-                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm text-amber-800">
-                  <span className="font-medium">How to export: </span>
-                  {selectedPlatform.hint}
-                </div>
-              )}
-
-              {/* Drop zone */}
-              <div
-                onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
-                onDragLeave={() => setDragging(false)}
-                onDrop={handleDrop}
-                onClick={() => fileInputRef.current?.click()}
-                className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors
-                  ${dragging ? 'border-blue-400 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}
-              >
-                <Upload className="w-8 h-8 text-gray-400 mx-auto mb-2" />
-                <p className="text-sm font-medium text-gray-700">Drop CSV file here or click to browse</p>
-                <p className="text-xs text-gray-400 mt-1">Supports .csv files</p>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".csv,text/csv"
-                  className="hidden"
-                  onChange={handleFileInput}
-                />
-              </div>
-
-              {importError && (
-                <div className="mt-3 flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
-                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-                  {importError}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ── Step: upload / preview ────────────────────────────────────── */}
-          {step === 'upload' && colMap && (
-            <div>
-              <div className="flex items-center gap-2 mb-3">
-                <CheckCircle className="w-4 h-4 text-green-600" />
-                <span className="text-sm font-medium text-gray-700">
-                  {rowCount} row{rowCount !== 1 ? 's' : ''} found
-                </span>
-                <button
-                  onClick={() => { setStep('platform'); fileInputRef.current?.click() }}
-                  className="ml-auto text-xs text-blue-600 hover:underline"
-                >
-                  Change file
-                </button>
-              </div>
-
-              {noPhoneWarn && (
-                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 text-sm text-amber-800">
-                  ⚠ No phone column detected. Clients will be imported without phone numbers (no deduplication).
-                </div>
-              )}
-
-              {/* Column mapping summary */}
-              <div className="flex flex-wrap gap-2 mb-3">
-                {(['name', 'phone', 'email', 'notes'] as const).map((field) => (
-                  <span
-                    key={field}
-                    className={`inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full font-medium
-                      ${colMap[field] >= 0
-                        ? 'bg-green-100 text-green-700'
-                        : 'bg-gray-100 text-gray-400'}`}
-                  >
-                    {colMap[field] >= 0 ? '✓' : '—'} {field}
-                    {colMap[field] >= 0 && (
-                      <span className="opacity-60">← {headers[colMap[field]]}</span>
-                    )}
-                  </span>
-                ))}
-              </div>
-
-              {/* Preview table */}
-              <div className="overflow-x-auto rounded-lg border border-gray-200 mb-4">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="bg-gray-50 border-b border-gray-200">
-                      <th className="px-3 py-2 text-left font-medium text-gray-500">Name</th>
-                      <th className="px-3 py-2 text-left font-medium text-gray-500">Phone</th>
-                      <th className="px-3 py-2 text-left font-medium text-gray-500">Email</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {preview.map((row, i) => (
-                      <tr key={i} className="border-b border-gray-100 last:border-0">
-                        <td className="px-3 py-2 text-gray-900 max-w-[150px] truncate">{row.name || <span className="text-gray-300">—</span>}</td>
-                        <td className="px-3 py-2 text-gray-600 max-w-[120px] truncate">{row.phone || <span className="text-gray-300">—</span>}</td>
-                        <td className="px-3 py-2 text-gray-600 max-w-[140px] truncate">{row.email || <span className="text-gray-300">—</span>}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                {rowCount > 5 && (
-                  <div className="px-3 py-2 text-xs text-gray-400 border-t border-gray-100 bg-gray-50">
-                    …and {rowCount - 5} more row{rowCount - 5 !== 1 ? 's' : ''}
-                  </div>
-                )}
-              </div>
-
-              {importError && (
-                <div className="mb-3 flex items-start gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
-                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-                  {importError}
-                </div>
-              )}
-
-              <div className="flex gap-2 justify-end">
-                <Button variant="outline" size="sm" onClick={() => setStep('platform')}>
-                  Back
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={handleImport}
-                  disabled={loading || rowCount === 0}
-                >
-                  {loading ? 'Importing…' : `Import ${rowCount} client${rowCount !== 1 ? 's' : ''}`}
-                </Button>
-              </div>
-            </div>
-          )}
-
-          {/* ── Step: result ──────────────────────────────────────────────── */}
-          {step === 'result' && (
-            <div className="text-center py-4">
-              <CheckCircle className="w-12 h-12 text-green-600 mx-auto mb-4" />
-              <h3 className="text-lg font-semibold text-gray-900 mb-2">Import complete</h3>
-              <p className="text-gray-600 mb-1">
-                <span className="font-semibold text-green-700">{resultImported}</span>{' '}
-                client{resultImported !== 1 ? 's' : ''} imported
-              </p>
-              {resultSkipped > 0 && (
-                <p className="text-sm text-gray-400 mb-4">
-                  {resultSkipped} skipped (duplicates or empty names)
-                </p>
-              )}
-              <Button onClick={handleClose} className="mt-2">
-                Done
-              </Button>
-            </div>
-          )}
+        <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-white rounded-xl shadow-xl w-[calc(100%-2rem)] max-w-2xl max-h-[90dvh] overflow-y-auto p-5 focus:outline-none" onEscapeKeyDown={e => { if (busy) e.preventDefault() }} onPointerDownOutside={e => { if (busy) e.preventDefault() }}>
+          <div className="flex justify-between gap-3 mb-2"><Dialog.Title className="text-lg font-semibold">Import clients</Dialog.Title><button type="button" aria-label="Close import" disabled={busy} onClick={close}><X className="w-5 h-5" /></button></div>
+          <Dialog.Description className="text-sm text-gray-600 mb-4">Choose contacts from your phone book or upload several contact files. Review and select clients before saving.</Dialog.Description>
+          {!result && <>
+            <div className="flex flex-wrap gap-2 mb-3"><Button type="button" variant="outline" disabled={busy} onClick={pickContacts}><ContactRound className="w-4 h-4 mr-2" />Phone book</Button><Button type="button" variant="outline" disabled={busy} onClick={() => input.current?.click()}><Upload className="w-4 h-4 mr-2" />Choose files</Button></div>
+            <input ref={input} type="file" multiple accept=".csv,.tsv,.xlsx,.xls,.vcf,.vcard" className="hidden" aria-label="Contact files" disabled={busy} onChange={e => { const files = Array.from(e.target.files ?? []); e.target.value = ''; void readFiles(files) }} />
+            <button type="button" disabled={busy} onClick={() => input.current?.click()} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); void readFiles(Array.from(e.dataTransfer.files)) }} className="w-full border-2 border-dashed rounded-xl p-5 text-sm text-gray-600 mb-3 disabled:opacity-50">Drop one or more CSV, Excel or vCard files here<br /><span className="text-xs text-gray-500">Up to 20 files · 5 MB per file · 10 MB combined · 5,000 contacts</span></button>
+            <p className="text-xs text-gray-500 mb-3">iPhone or unsupported browser? Export your phone book as .vcf and choose the file. Tables should use name, phone, email and notes columns. First / last name and Google Contacts exports are also supported.</p>
+            {sources.length > 0 && <p className="text-xs text-gray-500 mb-3 break-words">Sources: {sources.join(', ')}</p>}
+            {items.length > 0 && <>
+              <label className="flex gap-2 text-sm mb-3"><input type="checkbox" disabled={busy} checked={selected.length === items.length} onChange={e => { const checked = e.target.checked; setItems(current => current.map(item => ({ ...item, selected: checked }))) }} />Select all ({selected.length} / {items.length})</label>
+              <div className="overflow-auto max-h-72 border rounded-lg"><table className="w-full text-sm"><thead className="bg-gray-50"><tr><th className="p-2"><span className="sr-only">Select</span></th><th className="p-2 text-left">Name</th><th className="p-2 text-left">Phone</th><th className="p-2 text-left">Email</th></tr></thead><tbody>{preview.map((item, index) => <tr key={page * 50 + index} className="border-t"><td className="p-2"><input type="checkbox" aria-label={`Select ${item.name}`} checked={item.selected} disabled={busy} onChange={e => { const checked = e.target.checked; setItems(current => current.map((row, i) => i === page * 50 + index ? { ...row, selected: checked } : row)) }} /></td><td className="p-2 max-w-48 break-words">{item.name}</td><td className="p-2 whitespace-nowrap">{item.phone || '—'}</td><td className="p-2 break-all">{item.email || '—'}</td></tr>)}</tbody></table></div>
+              {items.length > 50 && <div className="flex justify-between items-center text-xs my-2"><button disabled={busy || !page} onClick={() => setPage(p => p - 1)}>Previous</button><span>Page {page + 1} / {Math.ceil(items.length / 50)}</span><button disabled={busy || (page + 1) * 50 >= items.length} onClick={() => setPage(p => p + 1)}>Next</button></div>}
+              <p className="text-xs text-gray-500 my-3">{skipped > 0 ? `${skipped} duplicate or unnamed contacts removed. ` : ''}Existing clients are kept. Duplicates are matched by phone or email. Contacts without either may be imported again.</p>
+              {busy && <p role="status" className="text-sm my-2">Processing… {progress} / {selected.length}</p>}
+              <Button type="button" disabled={busy || !selected.length} onClick={importSelected} className="w-full">{busy ? 'Processing…' : `Import ${selected.length} clients`}</Button>
+            </>}
+          </>}
+          {result && <div className="py-4 text-center" role="status"><CheckCircle className="w-10 h-10 text-green-600 mx-auto mb-3" /><h3 className="font-semibold">{result.failed ? 'Import stopped' : 'Import complete'}</h3><p className="my-2">{result.imported} clients added · {result.skipped} skipped</p><Button onClick={close}>Done</Button></div>}
+          {error && <div role="alert" className="mt-3 flex gap-2 text-sm text-red-700 bg-red-50 p-3 rounded-lg whitespace-pre-line"><AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />{error}</div>}
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
